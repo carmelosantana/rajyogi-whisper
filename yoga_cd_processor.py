@@ -1388,7 +1388,8 @@ class YogaCDProcessor:
         
         if skip_combine:
             print("Skipping combine step")
-            if not master_m4a_path.exists():
+            # For --only-bg-music mode, we don't need the M4A master file
+            if not background_music and not master_m4a_path.exists():
                 print(f"Warning: Master file {master_m4a_path} does not exist")
                 return False, None
         else:
