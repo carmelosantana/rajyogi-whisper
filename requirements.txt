@@ -1,0 +1,14 @@
+# Core dependencies for Yoga CD Processor
+pydub>=0.25.1
+openai-whisper>=20240930
+tqdm>=4.64.0
+
+# Optional: OpenAI API for Whisper (if using cloud transcription)
+openai>=1.0.0
+
+# Audio processing dependencies (automatically installed with pydub)
+# ffmpeg (system dependency - install via: brew install ffmpeg)
+
+# Development dependencies
+pytest>=7.0.0
+black>=22.0.0
