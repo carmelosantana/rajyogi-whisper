@@ -119,14 +119,14 @@ class YogaCDProcessor:
     def combine_audio_files(self, 
                           audio_files: List[Path], 
                           output_path: Path,
-                          crossfade_ms: int = 500) -> bool:
+                          crossfade_ms: int = 0) -> bool:
         """
         Combine multiple audio files into a single master file
         
         Args:
             audio_files: List of audio file paths to combine
             output_path: Where to save the combined audio
-            crossfade_ms: Crossfade duration in milliseconds
+            crossfade_ms: Crossfade duration in milliseconds (0 = no crossfade)
             
         Returns:
             True if successful, False otherwise
@@ -149,8 +149,11 @@ class YogaCDProcessor:
                     # First file, add as-is
                     combined_audio = audio
                 else:
-                    # Subsequent files, add with crossfade
-                    combined_audio = combined_audio.append(audio, crossfade=crossfade_ms)
+                    # Subsequent files, add with or without crossfade
+                    if crossfade_ms > 0:
+                        combined_audio = combined_audio.append(audio, crossfade=crossfade_ms)
+                    else:
+                        combined_audio = combined_audio + audio
             
             # Create output directory if it doesn't exist
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,6 +224,113 @@ class YogaCDProcessor:
             
         except Exception as e:
             print(f"Error converting audio: {e}")
+            return False
+    
+    def add_background_music(self,
+                           main_audio_path: Path,
+                           music_path: str,  # Accept string path
+                           output_path: Path,
+                           music_volume: float = 0.3,
+                           fade_in_ms: int = 3000,
+                           fade_out_ms: int = 3000) -> bool:
+        """
+        Add background music to main audio with configurable volume and fade
+        
+        Args:
+            main_audio_path: Path to the main audio file (yoga session)
+            music_path: Path to the background music file (string or Path)
+            output_path: Where to save the mixed audio
+            music_volume: Volume level for background music (0.0 to 1.0)
+            fade_in_ms: Fade in duration for music in milliseconds
+            fade_out_ms: Fade out duration for music in milliseconds
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Convert music_path to Path object if it's a string
+            if isinstance(music_path, str):
+                music_path = Path(music_path)
+            
+            print(f"Adding background music: {music_path.name}")
+            print(f"Music volume: {music_volume * 100:.0f}%, Fade in: {fade_in_ms}ms, Fade out: {fade_out_ms}ms")
+            
+            # Load main audio and background music
+            main_audio = AudioSegment.from_file(str(main_audio_path))
+            music = AudioSegment.from_file(str(music_path))
+            
+            main_duration = len(main_audio)
+            music_duration = len(music)
+            
+            print(f"Main audio: {main_duration/1000/60:.1f} minutes")
+            print(f"Music track: {music_duration/1000/60:.1f} minutes")
+            
+            # Extend music to match main audio duration if needed
+            if music_duration < main_duration:
+                # Calculate how many times to repeat
+                repeats_needed = (main_duration // music_duration) + 1
+                print(f"Repeating music {repeats_needed} times to match duration")
+                
+                # Repeat the music
+                extended_music = music
+                for _ in range(repeats_needed - 1):
+                    extended_music = extended_music + music
+                
+                # Trim to exact duration needed
+                music = extended_music[:main_duration]
+            else:
+                # Trim music to match main audio duration
+                music = music[:main_duration]
+            
+            # Adjust music volume
+            music = music - (60 - (music_volume * 60))  # Convert volume to dB reduction
+            
+            # Apply fade in and fade out to music
+            if fade_in_ms > 0:
+                music = music.fade_in(fade_in_ms)
+            if fade_out_ms > 0:
+                music = music.fade_out(fade_out_ms)
+            
+            # Mix the audio
+            print("Mixing audio with background music...")
+            mixed_audio = main_audio.overlay(music)
+            
+            # Create output directory if needed
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Export mixed audio
+            print(f"Exporting mixed audio to: {output_path}")
+            export_format = output_path.suffix[1:]
+            if export_format.lower() == 'm4a':
+                export_format = 'mp4'
+            mixed_audio.export(str(output_path), format=export_format)
+            
+            print(f"Successfully added background music")
+            return True
+            
+        except Exception as e:
+            print(f"Error adding background music: {e}")
+            return False
+    
+    def _clean_directory(self, directory: Path) -> bool:
+        """
+        Safely remove directory and all its contents
+        
+        Args:
+            directory: Directory to clean
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if directory.exists():
+                import shutil
+                print(f"Cleaning directory: {directory}")
+                shutil.rmtree(directory)
+                return True
+            return True
+        except Exception as e:
+            print(f"Error cleaning directory {directory}: {e}")
             return False
     
     def transcribe_audio(self, 
@@ -1236,7 +1346,12 @@ class YogaCDProcessor:
                          skip_transcribe: bool = False,
                          skip_split: bool = False,
                          mp3_file_path: Optional[Path] = None,
-                         whisper_model: str = "turbo") -> Tuple[bool, Optional[Path]]:
+                         whisper_model: str = "turbo",
+                         crossfade_ms: int = 0,
+                         background_music: Optional[str] = None,
+                         music_volume: float = 0.3,
+                         fade_in: int = 3000,
+                         fade_out: int = 3000) -> Tuple[bool, Optional[Path]]:
         """
         Process a single CD directory
         
@@ -1249,6 +1364,11 @@ class YogaCDProcessor:
             skip_split: Skip the intelligent splitting step
             mp3_file_path: Pre-converted MP3 file path (if skip_convert is True)
             whisper_model: Whisper model size to use for transcription
+            crossfade_ms: Crossfade duration in milliseconds (0 = no crossfade)
+            background_music: Path to background music file to mix in
+            music_volume: Volume level for background music (0.0 to 1.0)
+            fade_in: Fade in time for background music (milliseconds)
+            fade_out: Fade out time for background music (milliseconds)
             
         Returns:
             Tuple of (success, path_to_mp3_file)
@@ -1286,7 +1406,7 @@ class YogaCDProcessor:
                 # Still continue if file exists
             else:
                 # Combine files
-                if not self.combine_audio_files(audio_files, master_m4a_path):
+                if not self.combine_audio_files(audio_files, master_m4a_path, crossfade_ms):
                     return False, None
         
         # Step 2: Convert to MP3 (unless skipped)
@@ -1308,6 +1428,29 @@ class YogaCDProcessor:
                 if not self.convert_audio_format(master_m4a_path, mp3_output_path):
                     return False, None
         
+        # Step 2.5: Add background music (if specified)
+        final_mp3_path = mp3_output_path
+        if background_music:
+            print(f"\nAdding background music: {background_music}")
+            music_output_path = converted_dir / f"{cd_name}_with_music.mp3"
+            
+            # Only clean existing file if it exists, don't clean the whole directory
+            if music_output_path.exists():
+                music_output_path.unlink()
+            
+            if self.add_background_music(
+                mp3_output_path, 
+                background_music,  # Pass as string directly
+                music_output_path,
+                music_volume,
+                fade_in,
+                fade_out
+            ):
+                final_mp3_path = music_output_path
+                print(f"Background music added successfully: {final_mp3_path}")
+            else:
+                print("Warning: Failed to add background music, continuing with original audio")
+        
         # Step 3: Transcribe audio (unless skipped)
         transcript_path = None
         if skip_transcribe:
@@ -1327,9 +1470,9 @@ class YogaCDProcessor:
                 print("Skipping transcription due to existing file")
                 transcript_path = existing_transcript
             else:
-                # Transcribe the MP3 file
+                # Transcribe the MP3 file (use final_mp3_path which may include background music)
                 success, transcript_path = self.transcribe_audio(
-                    mp3_output_path, 
+                    final_mp3_path, 
                     output_dir, 
                     whisper_model,
                     use_chunking=getattr(self, 'use_chunking', False),
@@ -1346,7 +1489,7 @@ class YogaCDProcessor:
             if transcript_path and transcript_path.exists():
                 print("\nStarting intelligent audio splitting...")
                 success, split_files = self.intelligent_split_workflow(
-                    mp3_output_path, 
+                    final_mp3_path,  # Use final_mp3_path which may include background music
                     transcript_path, 
                     output_dir
                 )
@@ -1357,16 +1500,13 @@ class YogaCDProcessor:
         
         print(f"\nSuccessfully processed CD: {cd_name}")
         print(f"Master M4A: {master_m4a_path}")
-        print(f"Master MP3: {mp3_output_path}")
+        print(f"Master MP3: {final_mp3_path}")
         if transcript_path:
             print(f"Transcript: {transcript_path}")
         if split_files:
             print(f"Split tracks: {len(split_files)} files created")
-            splits_dir = output_dir / "splits" / cd_name
-            print(f"Tracks directory: {splits_dir}")
-            print(f"M3U playlist: {splits_dir / f'{cd_name}.m3u'}")
         
-        return True, mp3_output_path
+        return True, final_mp3_path
 
 
 def main():
@@ -1381,6 +1521,21 @@ Examples:
   
   # Process a single CD with specific Whisper model
   python yoga_cd_processor.py /path/to/single_cd --output ./processed_cds --whisper-model small
+  
+  # Use crossfade with default 500ms
+  python yoga_cd_processor.py /path/to/cds --output ./processed_cds --crossfade
+  
+  # Use custom crossfade duration
+  python yoga_cd_processor.py /path/to/cds --output ./processed_cds --crossfade 1000
+  
+  # Add background music with default settings
+  python yoga_cd_processor.py /path/to/cds --output ./processed_cds --background-music /path/to/ambient.mp3
+  
+  # Add background music with custom volume and fade times
+  python yoga_cd_processor.py /path/to/cds --output ./processed_cds --background-music /path/to/ambient.mp3 --music-volume 0.2 --fade-in 5000 --fade-out 5000
+  
+  # Only add background music to existing MP3 file
+  python yoga_cd_processor.py /path/to/cd --output ./processed_cds --only-bg-music --background-music /path/to/ambient.mp3 --mp3-file /path/to/existing.mp3
   
   # Use OpenAI API for transcription (requires API key)
   python yoga_cd_processor.py /path/to/cds --output ./processed_cds --use-openai-whisper
@@ -1420,8 +1575,8 @@ Examples:
                        help='Path to pre-converted MP3 file (use with --skip-convert)')
     
     # Processing options
-    parser.add_argument('--crossfade', type=int, default=500,
-                       help='Crossfade duration in milliseconds (default: 500)')
+    parser.add_argument('--crossfade', type=int, nargs='?', const=500, default=0,
+                       help='Enable crossfade with optional duration in milliseconds (default: 500ms when flag is used, 0ms when omitted)')
     parser.add_argument('--bitrate', default='192k',
                        help='MP3 bitrate (default: 192k)')
     parser.add_argument('--whisper-model', default='turbo',
@@ -1435,6 +1590,18 @@ Examples:
                        help='Duration of audio chunks in minutes (default: 3)')
     parser.add_argument('--openai-api-key', 
                        help='OpenAI API key (or set OPENAI_API_KEY environment variable)')
+    
+    # Background music options
+    parser.add_argument('--background-music', type=Path,
+                       help='Path to background music file to mix with the audio')
+    parser.add_argument('--music-volume', type=float, default=0.3,
+                       help='Volume level for background music (0.0 to 1.0, default: 0.3)')
+    parser.add_argument('--fade-in', type=int, default=3000,
+                       help='Fade in time for background music in milliseconds (default: 3000)')
+    parser.add_argument('--fade-out', type=int, default=3000,
+                       help='Fade out time for background music in milliseconds (default: 3000)')
+    parser.add_argument('--only-bg-music', action='store_true',
+                       help='Only add background music without other processing steps')
     
     args = parser.parse_args()
     
@@ -1450,6 +1617,29 @@ Examples:
     if args.mp3_file and not args.mp3_file.exists():
         print(f"Error: MP3 file {args.mp3_file} does not exist")
         return 1
+    
+    # Background music validation
+    if args.background_music and not args.background_music.exists():
+        print(f"Error: Background music file {args.background_music} does not exist")
+        return 1
+    
+    if args.music_volume < 0.0 or args.music_volume > 1.0:
+        print("Error: Music volume must be between 0.0 and 1.0")
+        return 1
+    
+    # Handle --only-bg-music mode
+    if args.only_bg_music:
+        if not args.background_music:
+            print("Error: --background-music is required when using --only-bg-music")
+            return 1
+        # Enable skipping of all other steps
+        args.skip_combine = True
+        args.skip_convert = True
+        args.skip_transcribe = True 
+        args.skip_split = True
+        if not args.mp3_file:
+            print("Error: --mp3-file is required when using --only-bg-music")
+            return 1
     
     # Set up OpenAI API key if using OpenAI Whisper
     if args.use_openai_whisper:
@@ -1488,7 +1678,12 @@ Examples:
             skip_transcribe=args.skip_transcribe,
             skip_split=args.skip_split,
             mp3_file_path=args.mp3_file,
-            whisper_model=args.whisper_model
+            whisper_model=args.whisper_model,
+            crossfade_ms=args.crossfade,
+            background_music=str(args.background_music) if args.background_music else None,
+            music_volume=args.music_volume,
+            fade_in=args.fade_in,
+            fade_out=args.fade_out
         )
         
         if not success:
@@ -1517,7 +1712,12 @@ Examples:
                     skip_transcribe=args.skip_transcribe,
                     skip_split=args.skip_split,
                     mp3_file_path=args.mp3_file if len(cd_directories) == 1 else None,
-                    whisper_model=args.whisper_model
+                    whisper_model=args.whisper_model,
+                    crossfade_ms=args.crossfade,
+                    background_music=str(args.background_music) if args.background_music else None,
+                    music_volume=args.music_volume,
+                    fade_in=args.fade_in,
+                    fade_out=args.fade_out
                 )
                 
                 if success:
