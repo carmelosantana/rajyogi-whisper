@@ -1434,10 +1434,6 @@ class YogaCDProcessor:
             print(f"\nAdding background music: {background_music}")
             music_output_path = converted_dir / f"{cd_name}_with_music.mp3"
             
-            # Only clean existing file if it exists, don't clean the whole directory
-            if music_output_path.exists():
-                music_output_path.unlink()
-            
             if self.add_background_music(
                 mp3_output_path, 
                 background_music,  # Pass as string directly
