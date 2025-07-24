@@ -149,7 +149,11 @@ class YogaCDProcessor:
             
             # Export combined audio (keep original format for master)
             print(f"Exporting combined audio to: {output_path}")
-            combined_audio.export(str(output_path), format=output_path.suffix[1:])
+            # Use correct format identifier for m4a files
+            export_format = output_path.suffix[1:]
+            if export_format.lower() == 'm4a':
+                export_format = 'mp4'
+            combined_audio.export(str(output_path), format=export_format)
             
             # Print summary
             total_duration = len(combined_audio) / 1000 / 60  # minutes
@@ -197,6 +201,9 @@ class YogaCDProcessor:
             elif target_format.lower() == 'wav':
                 # Lossless WAV
                 audio.export(str(output_path), format='wav')
+            elif target_format.lower() == 'm4a':
+                # M4A files use mp4 format identifier
+                audio.export(str(output_path), format='mp4')
             else:
                 # Generic export
                 audio.export(str(output_path), format=target_format)
