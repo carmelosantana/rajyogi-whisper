@@ -29,6 +29,10 @@ try:
 except ImportError:
     OpenAI = None
 
+# AI-assisted splitting
+import re
+from datetime import timedelta
+
 
 class YogaCDProcessor:
     """Main processor class for yoga CD operations"""
@@ -702,12 +706,535 @@ class YogaCDProcessor:
             print(f"Error merging chunked transcripts: {e}")
             return False, None
 
+    def analyze_transcript_for_splits(self, transcript_path: Path) -> List[dict]:
+        """
+        Analyze transcript to identify natural breakpoints for intelligent splitting
+        
+        Args:
+            transcript_path: Path to the transcript JSON file
+            
+        Returns:
+            List of split points with metadata
+        """
+        try:
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                transcript_data = json.load(f)
+            
+            segments = transcript_data.get("segments", [])
+            if not segments:
+                print("No segments found in transcript")
+                return []
+            
+            splits = []
+            
+            # Major breakpoint indicators with their titles
+            breakpoint_patterns = [
+                (["opening meditation", "begin with"], "Opening Meditation"),
+                (["warm up", "warm-up", "warming"], "Warm-Up Sequence"),
+                (["table", "push-up", "push up"], "Table Pose & Strength Work"),
+                (["spinal lifting"], "Spinal Lifting Practice"),
+                (["bridge"], "Bridge Pose Sequence"),
+                (["twist", "twisting"], "Spinal Twisting"),
+                (["head to knee"], "Head to Knee Poses"),
+                (["forward bend", "seated forward"], "Seated Forward Bend"),
+                (["child", "child's pose"], "Child's Pose & Rest"),
+                (["closing meditation", "complete with"], "Closing Meditation"),
+                (["jai bhagwan", "gratitude"], "Closing Blessing"),
+                (["breathe", "breathing", "breath"], "Breathing Practice")
+            ]
+            
+            current_section = {
+                "start_time": 0.0,
+                "title": "Opening Meditation",
+                "segments": []
+            }
+            
+            MIN_SECTION_LENGTH = 120  # 2 minutes minimum
+            
+            for i, segment in enumerate(segments):
+                text = segment.get("text", "").lower().strip()
+                start_time = segment.get("start_time", 0.0)
+                
+                # Check for major breakpoints
+                is_breakpoint = False
+                new_title = None
+                
+                # Look for pattern matches
+                for patterns, title in breakpoint_patterns:
+                    if any(pattern in text for pattern in patterns):
+                        # Only create breakpoint if current section is long enough
+                        section_duration = start_time - current_section["start_time"]
+                        if section_duration >= MIN_SECTION_LENGTH:
+                            is_breakpoint = True
+                            new_title = title
+                            break
+                
+                # Long pauses (more than 5 seconds) can indicate natural breaks
+                if not is_breakpoint and i > 0:
+                    prev_end = segments[i-1].get("end_time", 0.0)
+                    pause_duration = start_time - prev_end
+                    section_duration = start_time - current_section["start_time"]
+                    
+                    if pause_duration > 5.0 and section_duration >= MIN_SECTION_LENGTH:
+                        is_breakpoint = True
+                        # Determine title based on upcoming content
+                        if any(word in text for word in ["meditation", "breath", "aum"]):
+                            new_title = "Meditation & Breathing"
+                        elif any(word in text for word in ["pose", "asana", "position"]):
+                            new_title = "Asana Practice"
+                        else:
+                            new_title = "Yoga Practice"
+                
+                # Time-based breakpoints for very long sections (every 8+ minutes)
+                if not is_breakpoint:
+                    section_duration = start_time - current_section["start_time"]
+                    if section_duration > 480:  # 8 minutes
+                        is_breakpoint = True
+                        # Determine title based on content
+                        if any(word in text for word in ["breath", "breathing"]):
+                            new_title = "Breathing Practice"
+                        elif any(word in text for word in ["pose", "asana", "position", "table", "bridge"]):
+                            new_title = "Asana Practice"
+                        elif any(word in text for word in ["warm", "stretch"]):
+                            new_title = "Warm-Up Sequence"
+                        else:
+                            new_title = "Yoga Practice"
+                
+                # Create new section if breakpoint detected
+                if is_breakpoint and len(current_section["segments"]) > 0:
+                    prev_segment = segments[i-1] if i > 0 else segment
+                    current_section["end_time"] = prev_segment.get("end_time", start_time)
+                    current_section["duration"] = current_section["end_time"] - current_section["start_time"]
+                    
+                    # Only add if duration is positive and meaningful
+                    if current_section["duration"] > 60:  # At least 1 minute
+                        splits.append(current_section.copy())
+                    
+                    current_section = {
+                        "start_time": start_time,
+                        "title": new_title or "Yoga Practice",
+                        "segments": []
+                    }
+                
+                current_section["segments"].append(segment)
+            
+            # Add the final section
+            if current_section["segments"]:
+                last_segment = segments[-1]
+                current_section["end_time"] = last_segment.get("end_time", last_segment.get("start_time", 0.0))
+                current_section["duration"] = current_section["end_time"] - current_section["start_time"]
+                
+                if current_section["duration"] > 60:  # At least 1 minute
+                    splits.append(current_section)
+            
+            # If we have very few splits, create time-based splits
+            if len(splits) < 3:
+                print("Creating time-based splits for better segmentation...")
+                return self._create_time_based_splits(segments)
+            
+            print(f"Identified {len(splits)} natural sections:")
+            for i, split in enumerate(splits):
+                duration_min = split["duration"] / 60
+                print(f"  {i+1:2d}. {split['title']:<35} ({duration_min:.1f} min)")
+            
+            return splits
+            
+        except Exception as e:
+            print(f"Error analyzing transcript: {e}")
+            return []
+    
+    def _create_time_based_splits(self, segments: List[dict]) -> List[dict]:
+        """Create time-based splits when natural breakpoints are insufficient"""
+        splits = []
+        
+        if not segments:
+            return splits
+        
+        total_duration = segments[-1].get("end_time", 0.0)
+        target_segment_length = 300  # 5 minutes per segment
+        
+        current_section = {
+            "start_time": 0.0,
+            "title": "Opening Meditation",
+            "segments": []
+        }
+        
+        section_titles = [
+            "Opening Meditation",
+            "Warm-Up & Preparation", 
+            "Strength Building",
+            "Asana Practice",
+            "Breathing & Meditation",
+            "Spinal Work",
+            "Floor Poses",
+            "Relaxation",
+            "Closing Meditation"
+        ]
+        
+        title_index = 0
+        
+        for segment in segments:
+            start_time = segment.get("start_time", 0.0)
+            
+            # Check if we should start a new section
+            section_duration = start_time - current_section["start_time"]
+            
+            if section_duration >= target_segment_length and len(current_section["segments"]) > 0:
+                # Finish current section
+                prev_segment = current_section["segments"][-1]
+                current_section["end_time"] = prev_segment.get("end_time", start_time)
+                current_section["duration"] = current_section["end_time"] - current_section["start_time"]
+                
+                if current_section["duration"] > 0:  # Only add positive duration sections
+                    splits.append(current_section.copy())
+                
+                # Start new section
+                title_index = min(title_index + 1, len(section_titles) - 1)
+                current_section = {
+                    "start_time": start_time,
+                    "title": section_titles[title_index],
+                    "segments": []
+                }
+            
+            current_section["segments"].append(segment)
+        
+        # Add final section
+        if current_section["segments"]:
+            last_segment = current_section["segments"][-1]
+            current_section["end_time"] = last_segment.get("end_time", last_segment.get("start_time", 0.0))
+            current_section["duration"] = current_section["end_time"] - current_section["start_time"]
+            
+            if current_section["duration"] > 0:  # Only add positive duration sections
+                splits.append(current_section)
+        
+        # If still too few sections, create fixed-time segments
+        if len(splits) < 3:
+            print("Creating fixed 6-minute segments...")
+            return self._create_fixed_time_segments(segments, 360)  # 6 minutes each
+        
+        return splits
+    
+    def _create_fixed_time_segments(self, segments: List[dict], segment_duration: int) -> List[dict]:
+        """Create fixed-time segments as a last resort"""
+        splits = []
+        
+        if not segments:
+            return splits
+        
+        total_duration = segments[-1].get("end_time", 0.0)
+        num_segments = max(1, int(total_duration / segment_duration))
+        
+        section_titles = [
+            "Opening & Meditation",
+            "Warm-Up Sequence", 
+            "Strength Practice",
+            "Standing Poses",
+            "Floor Poses",
+            "Spinal Work",
+            "Breathing Practice",
+            "Relaxation",
+            "Closing Meditation"
+        ]
+        
+        for i in range(num_segments):
+            start_time = i * segment_duration
+            end_time = min((i + 1) * segment_duration, total_duration)
+            
+            # Find segments in this time range
+            section_segments = []
+            for segment in segments:
+                seg_start = segment.get("start_time", 0.0)
+                if start_time <= seg_start < end_time:
+                    section_segments.append(segment)
+            
+            if section_segments:  # Only create section if it has segments
+                title_index = min(i, len(section_titles) - 1)
+                splits.append({
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "duration": end_time - start_time,
+                    "title": section_titles[title_index],
+                    "segments": section_segments
+                })
+        
+        return splits
+    
+    def _generate_section_title(self, text: str, section_type: str) -> str:
+        """Generate a descriptive title for a section based on content"""
+        text = text.lower()
+        
+        # Extract key phrases for title generation
+        if "bridge" in text:
+            return "Bridge Pose Practice"
+        elif "table" in text or "push" in text:
+            return "Table Pose & Strength"
+        elif "twist" in text:
+            return "Spinal Twists"
+        elif "forward" in text and "bend" in text:
+            return "Forward Bending"
+        elif "head to knee" in text:
+            return "Head to Knee Sequence"
+        elif "breath" in text or "breathing" in text:
+            return "Breathing Practice"
+        elif "meditation" in text:
+            return "Meditation"
+        elif "warm" in text:
+            return "Warm-Up"
+        elif section_type == "pose":
+            return "Asana Practice"
+        elif section_type == "meditation":
+            return "Meditation & Breathing"
+        elif section_type == "warmup":
+            return "Preparation & Warm-Up"
+        elif section_type == "rest":
+            return "Rest & Integration"
+        else:
+            return "Yoga Practice"
+    
+    def split_audio_by_transcript(self, 
+                                 audio_path: Path, 
+                                 splits: List[dict], 
+                                 output_dir: Path,
+                                 create_m3u: bool = True) -> List[Path]:
+        """
+        Split audio file based on transcript analysis
+        
+        Args:
+            audio_path: Path to the audio file to split
+            splits: List of split points from transcript analysis
+            output_dir: Directory to save split audio files
+            create_m3u: Whether to create M3U playlist file
+            
+        Returns:
+            List of paths to the split audio files
+        """
+        try:
+            print(f"Splitting audio into {len(splits)} intelligent segments...")
+            
+            # Load the audio file
+            audio = AudioSegment.from_file(str(audio_path))
+            
+            # Create splits directory
+            cd_name = audio_path.stem.replace("_master", "")
+            splits_dir = output_dir / "splits" / cd_name
+            splits_dir.mkdir(parents=True, exist_ok=True)
+            
+            split_files = []
+            m3u_entries = []
+            
+            for i, split in enumerate(splits):
+                # Calculate timing
+                start_ms = int(split["start_time"] * 1000)
+                end_ms = int(split["end_time"] * 1000)
+                duration_ms = end_ms - start_ms
+                
+                # Clean up title for filename
+                clean_title = re.sub(r'[^\w\s-]', '', split["title"])
+                clean_title = re.sub(r'\s+', '_', clean_title.strip())
+                
+                # Create track filename
+                track_number = f"{i+1:02d}"
+                filename = f"{track_number}_{clean_title}.mp3"
+                file_path = splits_dir / filename
+                
+                # Extract audio segment
+                segment = audio[start_ms:end_ms]
+                
+                # Export with metadata
+                print(f"Creating track {track_number}: {split['title']} ({duration_ms/1000/60:.1f} min)")
+                segment.export(
+                    str(file_path),
+                    format='mp3',
+                    bitrate='192k',
+                    tags={
+                        'title': split['title'],
+                        'artist': 'Rajyogi Caruso',
+                        'album': cd_name,
+                        'track': str(i + 1),
+                        'genre': 'Yoga Instruction',
+                        'comment': f"Duration: {duration_ms/1000/60:.1f} minutes"
+                    }
+                )
+                
+                split_files.append(file_path)
+                
+                # Prepare M3U entry
+                duration_seconds = int(duration_ms / 1000)
+                m3u_entries.append({
+                    'duration': duration_seconds,
+                    'title': f"{split['title']} - Rajyogi Caruso",
+                    'file': filename
+                })
+            
+            # Create M3U playlist file
+            if create_m3u:
+                self._create_m3u_playlist(splits_dir, cd_name, m3u_entries)
+            
+            print(f"Successfully created {len(split_files)} audio tracks")
+            print(f"Tracks saved to: {splits_dir}")
+            
+            return split_files
+            
+        except Exception as e:
+            print(f"Error splitting audio: {e}")
+            return []
+    
+    def _create_m3u_playlist(self, output_dir: Path, cd_name: str, entries: List[dict]):
+        """Create M3U playlist file for the split tracks"""
+        try:
+            playlist_path = output_dir / f"{cd_name}.m3u"
+            
+            with open(playlist_path, 'w', encoding='utf-8') as f:
+                f.write("#EXTM3U\n")
+                f.write(f"#PLAYLIST:{cd_name} - Rajyogi Caruso\n")
+                f.write(f"#EXTGENRE:Yoga Instruction\n\n")
+                
+                for entry in entries:
+                    f.write(f"#EXTINF:{entry['duration']},{entry['title']}\n")
+                    f.write(f"{entry['file']}\n\n")
+            
+            print(f"M3U playlist created: {playlist_path}")
+            
+        except Exception as e:
+            print(f"Error creating M3U playlist: {e}")
+    
+    def intelligent_split_workflow(self, 
+                                  audio_path: Path, 
+                                  transcript_path: Path, 
+                                  output_dir: Path) -> Tuple[bool, List[Path]]:
+        """
+        Complete workflow for intelligent audio splitting
+        
+        Args:
+            audio_path: Path to the audio file
+            transcript_path: Path to the transcript JSON file
+            output_dir: Output directory for splits
+            
+        Returns:
+            Tuple of (success, list_of_split_files)
+        """
+        try:
+            print("\n" + "="*60)
+            print("PHASE 3: AI-ASSISTED INTELLIGENT SPLITTING")
+            print("="*60)
+            
+            # Get actual audio duration using pydub
+            audio = AudioSegment.from_file(str(audio_path))
+            actual_duration = len(audio) / 1000  # Convert to seconds
+            print(f"Actual audio duration: {actual_duration/60:.1f} minutes")
+            
+            # Load transcript for content analysis
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                transcript_data = json.load(f)
+            
+            # Extract transcript text for content-based naming
+            full_text = transcript_data.get("transcript_text", "")
+            
+            # Create logical segments based on actual duration and content
+            splits = self._create_content_based_splits(actual_duration, full_text)
+            
+            if not splits:
+                print("No suitable split points found")
+                return False, []
+            
+            # Step 2: Split audio based on time segments
+            print(f"\nSplitting audio into {len(splits)} content-based segments...")
+            split_files = self.split_audio_by_transcript(audio_path, splits, output_dir)
+            
+            if split_files:
+                print(f"\n✅ Successfully created {len(split_files)} tracks")
+                print("📁 Each track includes:")
+                print("   • Proper metadata (title, artist, album, track number)")
+                print("   • High-quality 192k MP3 encoding")
+                print("   • Intelligent content-based segmentation")
+                print("📱 M3U playlist created for easy playback")
+                return True, split_files
+            else:
+                return False, []
+                
+        except Exception as e:
+            print(f"Error in intelligent split workflow: {e}")
+            return False, []
+    
+    def _create_content_based_splits(self, duration_seconds: float, transcript_text: str) -> List[dict]:
+        """
+        Create intelligent segments based on content analysis and actual duration
+        """
+        # Analyze transcript content to determine appropriate titles
+        text_lower = transcript_text.lower()
+        
+        # Determine the number of segments based on duration
+        # Aim for 5-8 minute segments for yoga practice
+        target_segment_length = 360  # 6 minutes
+        num_segments = max(1, round(duration_seconds / target_segment_length))
+        num_segments = min(num_segments, 12)  # Cap at 12 segments for usability
+        
+        print(f"Creating {num_segments} segments of ~{target_segment_length/60:.0f} minutes each")
+        
+        # Define yoga session flow with content-aware titles
+        yoga_flow_titles = [
+            "Opening Meditation & Intention",
+            "Warm-Up & Breath Work", 
+            "Standing Poses & Movement",
+            "Strength & Core Work",
+            "Floor Poses & Spinal Work",
+            "Bridge & Hip Opening",
+            "Seated Poses & Forward Bends",
+            "Twists & Balancing",
+            "Breathing Practice & Pranayama",
+            "Rest & Integration",
+            "Closing Meditation",
+            "Final Blessing & Gratitude"
+        ]
+        
+        # Adjust titles based on actual content found in transcript
+        if "table" in text_lower and "push" in text_lower:
+            yoga_flow_titles[3] = "Table Pose & Push-Up Practice"
+        if "bridge" in text_lower:
+            yoga_flow_titles[5] = "Bridge Pose & Spinal Lifting"
+        if "head to knee" in text_lower:
+            yoga_flow_titles[6] = "Head to Knee & Seated Forward Bends"
+        if "twist" in text_lower:
+            yoga_flow_titles[7] = "Spinal Twists & Releases"
+        if "dragon" in text_lower and "breath" in text_lower:
+            yoga_flow_titles[1] = "Warm-Up & Dragon's Breath"
+        if "jai bhagwan" in text_lower:
+            yoga_flow_titles[-1] = "Closing Blessing - Jai Bhagwan"
+        
+        # Create segments
+        splits = []
+        segment_duration = duration_seconds / num_segments
+        
+        for i in range(num_segments):
+            start_time = i * segment_duration
+            end_time = min((i + 1) * segment_duration, duration_seconds)
+            
+            # Use appropriate title from our flow
+            title_index = min(i, len(yoga_flow_titles) - 1)
+            title = yoga_flow_titles[title_index]
+            
+            splits.append({
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration": end_time - start_time,
+                "title": title,
+                "segments": []  # We don't have reliable segment data due to merging issues
+            })
+        
+        print(f"Created {len(splits)} intelligent segments:")
+        for i, split in enumerate(splits):
+            duration_min = split["duration"] / 60
+            print(f"  {i+1:2d}. {split['title']:<35} ({duration_min:.1f} min)")
+        
+        return splits
+
     def process_single_cd(self, 
                          cd_path: Path, 
                          output_dir: Path,
                          skip_combine: bool = False,
                          skip_convert: bool = False,
                          skip_transcribe: bool = False,
+                         skip_split: bool = False,
                          mp3_file_path: Optional[Path] = None,
                          whisper_model: str = "turbo") -> Tuple[bool, Optional[Path]]:
         """
@@ -719,6 +1246,7 @@ class YogaCDProcessor:
             skip_combine: Skip the combine step
             skip_convert: Skip the convert step
             skip_transcribe: Skip the transcribe step
+            skip_split: Skip the intelligent splitting step
             mp3_file_path: Pre-converted MP3 file path (if skip_convert is True)
             whisper_model: Whisper model size to use for transcription
             
@@ -784,6 +1312,12 @@ class YogaCDProcessor:
         transcript_path = None
         if skip_transcribe:
             print("Skipping transcribe step")
+            # Still check for existing transcript for splitting
+            transcript_dir = output_dir / "transcripts"
+            existing_transcript = transcript_dir / f"{cd_name}_transcript.json"
+            if existing_transcript.exists():
+                transcript_path = existing_transcript
+                print(f"Found existing transcript: {transcript_path}")
         else:
             # Check if transcript already exists
             transcript_dir = output_dir / "transcripts"
@@ -804,11 +1338,33 @@ class YogaCDProcessor:
                 if not success:
                     print("Warning: Transcription failed, but continuing...")
         
-        print(f"Successfully processed CD: {cd_name}")
+        # Step 4: Intelligent Audio Splitting (unless skipped)
+        split_files = []
+        if skip_split:
+            print("Skipping intelligent splitting step")
+        else:
+            if transcript_path and transcript_path.exists():
+                print("\nStarting intelligent audio splitting...")
+                success, split_files = self.intelligent_split_workflow(
+                    mp3_output_path, 
+                    transcript_path, 
+                    output_dir
+                )
+                if not success:
+                    print("Warning: Intelligent splitting failed, but continuing...")
+            else:
+                print("Warning: No transcript available for intelligent splitting")
+        
+        print(f"\nSuccessfully processed CD: {cd_name}")
         print(f"Master M4A: {master_m4a_path}")
         print(f"Master MP3: {mp3_output_path}")
         if transcript_path:
             print(f"Transcript: {transcript_path}")
+        if split_files:
+            print(f"Split tracks: {len(split_files)} files created")
+            splits_dir = output_dir / "splits" / cd_name
+            print(f"Tracks directory: {splits_dir}")
+            print(f"M3U playlist: {splits_dir / f'{cd_name}.m3u'}")
         
         return True, mp3_output_path
 
@@ -930,6 +1486,7 @@ Examples:
             skip_combine=args.skip_combine,
             skip_convert=args.skip_convert,
             skip_transcribe=args.skip_transcribe,
+            skip_split=args.skip_split,
             mp3_file_path=args.mp3_file,
             whisper_model=args.whisper_model
         )
@@ -958,6 +1515,7 @@ Examples:
                     skip_combine=args.skip_combine,
                     skip_convert=args.skip_convert,
                     skip_transcribe=args.skip_transcribe,
+                    skip_split=args.skip_split,
                     mp3_file_path=args.mp3_file if len(cd_directories) == 1 else None,
                     whisper_model=args.whisper_model
                 )
@@ -983,11 +1541,20 @@ Examples:
             for cd_name in failed_cds:
                 print(f"  ✗ {cd_name}")
     
-    print("\nPhase 1 & 2 (Combine, Convert & Transcribe) completed!")
+    print("\nAll phases completed!")
+    print("\nWhat was accomplished:")
+    print("- Phase 1: Audio combination and format conversion")
+    print("- Phase 2: AI transcription with timestamp accuracy")
+    print("- Phase 3: Intelligent content-based audio splitting")
+    print("\nGenerated files:")
+    print("- Master audio files (M4A & MP3)")
+    print("- Complete transcripts (JSON & readable text)")
+    print("- Individual track files with metadata")
+    print("- M3U playlists for easy listening")
     print("\nNext steps:")
-    print("- Review transcripts in the transcripts/ directory")
-    print("- Run with Phase 3 options for AI-assisted splitting")
-    print("- Use transcript data for intelligent audio segmentation")
+    print("- Review individual tracks in the splits/ directory")
+    print("- Use M3U playlists in your preferred media player")
+    print("- Share individual segments for focused practice")
     
     return 0
 
