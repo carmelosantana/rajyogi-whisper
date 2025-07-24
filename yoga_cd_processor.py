@@ -24,6 +24,10 @@ from pydub import AudioSegment
 
 # Transcription
 import whisper
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 
 class YogaCDProcessor:
@@ -215,12 +219,497 @@ class YogaCDProcessor:
             print(f"Error converting audio: {e}")
             return False
     
+    def transcribe_audio(self, 
+                        audio_path: Path, 
+                        output_dir: Path,
+                        model_size: str = "turbo",
+                        use_chunking: bool = False,
+                        chunk_duration_minutes: int = 10) -> Tuple[bool, Optional[Path]]:
+        """
+        Transcribe audio file using Whisper (local or OpenAI API)
+        
+        Args:
+            audio_path: Path to audio file to transcribe
+            output_dir: Directory to save transcript
+            model_size: Whisper model size (tiny, base, small, medium, large, turbo)
+            use_chunking: Whether to split audio into chunks for stability
+            chunk_duration_minutes: Duration of each chunk in minutes
+            
+        Returns:
+            Tuple of (success, path_to_transcript_file)
+        """
+        try:
+            print(f"Transcribing audio: {audio_path.name}")
+            
+            if use_chunking:
+                return self._transcribe_with_chunking(audio_path, output_dir, model_size, chunk_duration_minutes)
+            elif self.use_openai_whisper:
+                return self._transcribe_with_openai_api(audio_path, output_dir, model_size)
+            else:
+                return self._transcribe_with_local_whisper(audio_path, output_dir, model_size)
+                
+        except Exception as e:
+            print(f"Error transcribing audio: {e}")
+            return False, None
+    
+    def _transcribe_with_chunking(self,
+                                 audio_path: Path,
+                                 output_dir: Path,
+                                 model_size: str,
+                                 chunk_duration_minutes: int) -> Tuple[bool, Optional[Path]]:
+        """
+        Transcribe audio using chunking approach for memory stability
+        """
+        try:
+            print(f"Using chunked transcription with {chunk_duration_minutes}-minute chunks...")
+            
+            # Split audio into chunks
+            chunks = self._chunk_audio_for_transcription(audio_path, chunk_duration_minutes)
+            
+            if len(chunks) == 1:
+                print("Audio is short enough - transcribing directly")
+                if self.use_openai_whisper:
+                    return self._transcribe_with_openai_api(audio_path, output_dir, model_size)
+                else:
+                    return self._transcribe_with_local_whisper(audio_path, output_dir, model_size)
+            
+            # Transcribe each chunk
+            chunk_transcripts = []
+            for i, chunk_path in enumerate(chunks):
+                print(f"Transcribing chunk {i+1}/{len(chunks)}: {chunk_path.name}")
+                
+                if self.use_openai_whisper:
+                    success, _ = self._transcribe_with_openai_api(chunk_path, output_dir, model_size)
+                else:
+                    success, _ = self._transcribe_with_local_whisper(chunk_path, output_dir, model_size)
+                
+                if success:
+                    # Load the transcript data for merging
+                    chunk_name = chunk_path.stem
+                    transcript_dir = output_dir / "transcripts"
+                    chunk_transcript_path = transcript_dir / f"{chunk_name}_transcript.json"
+                    
+                    if chunk_transcript_path.exists():
+                        with open(chunk_transcript_path, 'r', encoding='utf-8') as f:
+                            chunk_transcript = json.load(f)
+                            chunk_transcripts.append(chunk_transcript)
+                        
+                        # Clean up chunk transcript file
+                        chunk_transcript_path.unlink()
+                        (transcript_dir / f"{chunk_name}_transcript.txt").unlink(missing_ok=True)
+                    else:
+                        print(f"Warning: Chunk transcript not found: {chunk_transcript_path}")
+                else:
+                    print(f"Failed to transcribe chunk {i+1}")
+                    return False, None
+            
+            # Merge chunk transcripts
+            if chunk_transcripts:
+                return self._merge_chunked_transcripts(chunk_transcripts, audio_path, output_dir)
+            else:
+                print("No successful chunk transcriptions")
+                return False, None
+                
+        except Exception as e:
+            print(f"Error in chunked transcription: {e}")
+            return False, None
+    
+    def _transcribe_with_openai_api(self, 
+                                   audio_path: Path, 
+                                   output_dir: Path,
+                                   model_size: str = "whisper-1") -> Tuple[bool, Optional[Path]]:
+        """
+        Transcribe using OpenAI API (much lower memory usage)
+        """
+        if OpenAI is None:
+            print("Error: OpenAI library not installed. Run: pip install openai")
+            return False, None
+        
+        try:
+            print(f"Using OpenAI API for transcription...")
+            
+            # Initialize OpenAI client (requires OPENAI_API_KEY environment variable)
+            client = OpenAI()
+            
+            # Check file size (OpenAI has 25MB limit)
+            file_size_mb = audio_path.stat().st_size / (1024 * 1024)
+            if file_size_mb > 25:
+                print(f"Warning: File size ({file_size_mb:.1f}MB) exceeds OpenAI 25MB limit")
+                print("Consider chunking the audio file or using local Whisper")
+                return False, None
+            
+            # Transcribe with OpenAI API
+            with open(audio_path, "rb") as audio_file:
+                response = client.audio.transcriptions.create(
+                    model="whisper-1",  # OpenAI only has one Whisper model
+                    file=audio_file,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"]
+                )
+            
+            # Process response
+            return self._save_openai_transcript(response, audio_path, output_dir)
+            
+        except Exception as e:
+            print(f"Error with OpenAI API transcription: {e}")
+            print("Falling back to local Whisper...")
+            return self._transcribe_with_local_whisper(audio_path, output_dir, model_size)
+    
+    def _transcribe_with_local_whisper(self, 
+                                      audio_path: Path, 
+                                      output_dir: Path,
+                                      model_size: str = "turbo") -> Tuple[bool, Optional[Path]]:
+        """
+        Transcribe using local Whisper model (higher memory usage)
+        """
+        print(f"Using local Whisper model: {model_size}")
+        
+        try:
+            # Clear any existing model to free memory
+            if hasattr(self, 'whisper_model') and self.whisper_model is not None:
+                del self.whisper_model
+                import gc
+                gc.collect()
+            
+            # Load Whisper model with memory optimization
+            print(f"Loading Whisper model '{model_size}' with memory optimization...")
+            
+            import torch
+            # Use CPU to avoid GPU memory issues
+            device = "cpu"
+            
+            # Load model with explicit device setting
+            self.whisper_model = whisper.load_model(model_size, device=device)
+            self.whisper_model.model_name = model_size
+            
+            # Transcribe audio with memory-friendly settings
+            print("Starting transcription... (this may take a while)")
+            result = self.whisper_model.transcribe(
+                str(audio_path),
+                language="en",  # Assuming English yoga sessions
+                task="transcribe",
+                verbose=False,  # Reduce output to save memory
+                word_timestamps=True,  # Enable word-level timestamps
+                fp16=False,  # Use FP32 for stability on CPU
+                no_speech_threshold=0.6,  # More aggressive silence detection
+                logprob_threshold=-1.0,  # More permissive
+                compression_ratio_threshold=2.4  # More permissive
+            )
+            
+            # Clear model after use to free memory
+            del self.whisper_model
+            self.whisper_model = None
+            import gc
+            gc.collect()
+            
+            return self._save_local_whisper_transcript(result, audio_path, output_dir, model_size)
+            
+        except Exception as e:
+            print(f"Error in local Whisper transcription: {e}")
+            # Clean up on error
+            if hasattr(self, 'whisper_model'):
+                del self.whisper_model
+                self.whisper_model = None
+                import gc
+                gc.collect()
+            return False, None
+    
+    def _save_openai_transcript(self, 
+                               response, 
+                               audio_path: Path, 
+                               output_dir: Path) -> Tuple[bool, Optional[Path]]:
+        """
+        Save OpenAI API transcript response to files
+        """
+        # Create transcript output directory
+        transcript_dir = output_dir / "transcripts"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate transcript filename
+        cd_name = audio_path.stem.replace("_master", "")
+        transcript_path = transcript_dir / f"{cd_name}_transcript.json"
+        
+        # Prepare transcript data
+        transcript_data = {
+            "cd_title": cd_name,
+            "speaker": "Rajyogi Caruso",
+            "audio_file": str(audio_path),
+            "model_used": "openai-whisper-1",
+            "language": response.language,
+            "duration_seconds": response.duration,
+            "transcript_text": response.text,
+            "segments": []
+        }
+        
+        # Process segments
+        for segment in response.segments:
+            segment_data = {
+                "id": segment.id,
+                "start_time": segment.start,
+                "end_time": segment.end,
+                "duration": segment.end - segment.start,
+                "text": segment.text.strip(),
+                "speaker": "Rajyogi Caruso",
+                "confidence": getattr(segment, 'avg_logprob', 0.0)
+            }
+            
+            # Add word-level timestamps if available
+            if hasattr(segment, 'words') and segment.words:
+                segment_data["words"] = [
+                    {
+                        "word": word.word,
+                        "start": word.start,
+                        "end": word.end,
+                        "confidence": getattr(word, 'probability', 0.0)
+                    }
+                    for word in segment.words
+                ]
+            
+            transcript_data["segments"].append(segment_data)
+        
+        # Save transcript to JSON file
+        print(f"Saving transcript to: {transcript_path}")
+        with open(transcript_path, 'w', encoding='utf-8') as f:
+            json.dump(transcript_data, f, indent=2, ensure_ascii=False)
+        
+        # Generate readable text version
+        text_path = transcript_dir / f"{cd_name}_transcript.txt"
+        with open(text_path, 'w', encoding='utf-8') as f:
+            f.write(f"Yoga CD Transcript: {cd_name}\n")
+            f.write(f"Speaker: Rajyogi Caruso\n")
+            f.write(f"Duration: {transcript_data['duration_seconds']/60:.1f} minutes\n")
+            f.write(f"Transcription Model: openai-whisper-1\n")
+            f.write("="*60 + "\n\n")
+            
+            for segment in transcript_data["segments"]:
+                start_min = int(segment["start_time"] // 60)
+                start_sec = int(segment["start_time"] % 60)
+                f.write(f"[{start_min:02d}:{start_sec:02d}] {segment['text']}\n")
+        
+        print(f"Transcription completed!")
+        print(f"JSON transcript: {transcript_path}")
+        print(f"Text transcript: {text_path}")
+        
+        return True, transcript_path
+    
+    def _save_local_whisper_transcript(self, 
+                                      result, 
+                                      audio_path: Path, 
+                                      output_dir: Path,
+                                      model_size: str) -> Tuple[bool, Optional[Path]]:
+        """
+        Save local Whisper transcript to files
+        """
+        # Create transcript output directory
+        transcript_dir = output_dir / "transcripts"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate transcript filename
+        cd_name = audio_path.stem.replace("_master", "")
+        transcript_path = transcript_dir / f"{cd_name}_transcript.json"
+        
+        # Prepare transcript data with speaker information
+        transcript_data = {
+            "cd_title": cd_name,
+            "speaker": "Rajyogi Caruso",  # Primary speaker
+            "audio_file": str(audio_path),
+            "model_used": model_size,
+            "language": result.get("language", "en"),
+            "duration_seconds": len(AudioSegment.from_file(str(audio_path))) / 1000,
+            "transcript_text": result["text"],
+            "segments": []
+        }
+        
+        # Process segments with timestamps
+        for segment in result["segments"]:
+            segment_data = {
+                "id": segment["id"],
+                "start_time": segment["start"],
+                "end_time": segment["end"],
+                "duration": segment["end"] - segment["start"],
+                "text": segment["text"].strip(),
+                "speaker": "Rajyogi Caruso",  # Default speaker
+                "confidence": segment.get("avg_logprob", 0.0)
+            }
+            
+            # Add word-level timestamps if available
+            if "words" in segment:
+                segment_data["words"] = [
+                    {
+                        "word": word["word"],
+                        "start": word["start"],
+                        "end": word["end"],
+                        "confidence": word.get("probability", 0.0)
+                    }
+                    for word in segment["words"]
+                ]
+            
+            transcript_data["segments"].append(segment_data)
+        
+        # Save transcript to JSON file
+        print(f"Saving transcript to: {transcript_path}")
+        with open(transcript_path, 'w', encoding='utf-8') as f:
+            json.dump(transcript_data, f, indent=2, ensure_ascii=False)
+        
+        # Generate readable text version
+        text_path = transcript_dir / f"{cd_name}_transcript.txt"
+        with open(text_path, 'w', encoding='utf-8') as f:
+            f.write(f"Yoga CD Transcript: {cd_name}\n")
+            f.write(f"Speaker: Rajyogi Caruso\n")
+            f.write(f"Duration: {transcript_data['duration_seconds']/60:.1f} minutes\n")
+            f.write(f"Transcription Model: {model_size}\n")
+            f.write("="*60 + "\n\n")
+            
+            for segment in transcript_data["segments"]:
+                start_min = int(segment["start_time"] // 60)
+                start_sec = int(segment["start_time"] % 60)
+                f.write(f"[{start_min:02d}:{start_sec:02d}] {segment['text']}\n")
+        
+        print(f"Transcription completed!")
+        print(f"JSON transcript: {transcript_path}")
+        print(f"Text transcript: {text_path}")
+        
+        return True, transcript_path
+
+    def _chunk_audio_for_transcription(self, 
+                                      audio_path: Path, 
+                                      chunk_duration_minutes: int = 3) -> List[Path]:
+        """
+        Split large audio files into smaller chunks for more stable transcription
+        
+        Args:
+            audio_path: Path to the audio file to chunk
+            chunk_duration_minutes: Duration of each chunk in minutes
+            
+        Returns:
+            List of paths to the audio chunks
+        """
+        try:
+            audio = AudioSegment.from_file(str(audio_path))
+            duration_ms = len(audio)
+            chunk_duration_ms = chunk_duration_minutes * 60 * 1000
+            
+            chunks = []
+            chunk_dir = audio_path.parent / f"{audio_path.stem}_chunks"
+            chunk_dir.mkdir(exist_ok=True)
+            
+            # If file is smaller than chunk size, return original
+            if duration_ms <= chunk_duration_ms:
+                return [audio_path]
+            
+            print(f"Splitting audio into {chunk_duration_minutes}-minute chunks with optimized encoding...")
+            
+            for i, start_ms in enumerate(range(0, duration_ms, chunk_duration_ms)):
+                end_ms = min(start_ms + chunk_duration_ms, duration_ms)
+                chunk = audio[start_ms:end_ms]
+                
+                # Convert to mono and reduce sample rate for smaller file size
+                chunk = chunk.set_channels(1)  # Mono audio
+                chunk = chunk.set_frame_rate(16000)  # Lower sample rate (sufficient for speech)
+                
+                chunk_path = chunk_dir / f"chunk_{i:03d}.mp3"
+                # Use lower bitrate and optimize for speech
+                chunk.export(str(chunk_path), 
+                           format='mp3', 
+                           bitrate='64k',  # Much lower bitrate for speech
+                           parameters=["-ac", "1", "-ar", "16000"])  # Force mono, 16kHz
+                chunks.append(chunk_path)
+                print(f"Created chunk {i+1}: {chunk_path.name}")
+            
+            return chunks
+            
+        except Exception as e:
+            print(f"Error chunking audio: {e}")
+            return [audio_path]  # Return original file as fallback
+    
+    def _merge_chunked_transcripts(self, 
+                                  chunk_transcripts: List[dict], 
+                                  original_audio_path: Path,
+                                  output_dir: Path) -> Tuple[bool, Optional[Path]]:
+        """
+        Merge transcripts from multiple audio chunks into a single transcript
+        """
+        try:
+            # Create combined transcript data
+            cd_name = original_audio_path.stem.replace("_master", "")
+            
+            combined_transcript = {
+                "cd_title": cd_name,
+                "speaker": "Rajyogi Caruso",
+                "audio_file": str(original_audio_path),
+                "model_used": chunk_transcripts[0].get("model_used", "chunked"),
+                "language": chunk_transcripts[0].get("language", "en"),
+                "duration_seconds": sum(t.get("duration_seconds", 0) for t in chunk_transcripts),
+                "transcript_text": "",
+                "segments": []
+            }
+            
+            # Merge segments with adjusted timestamps
+            segment_id = 0
+            time_offset = 0.0
+            
+            for chunk_transcript in chunk_transcripts:
+                combined_transcript["transcript_text"] += chunk_transcript.get("transcript_text", "") + " "
+                
+                for segment in chunk_transcript.get("segments", []):
+                    adjusted_segment = segment.copy()
+                    adjusted_segment["id"] = segment_id
+                    adjusted_segment["start_time"] += time_offset
+                    adjusted_segment["end_time"] += time_offset
+                    
+                    # Adjust word timestamps if present
+                    if "words" in adjusted_segment:
+                        for word in adjusted_segment["words"]:
+                            word["start"] += time_offset
+                            word["end"] += time_offset
+                    
+                    combined_transcript["segments"].append(adjusted_segment)
+                    segment_id += 1
+                
+                # Update time offset for next chunk
+                if chunk_transcript.get("segments"):
+                    last_segment = chunk_transcript["segments"][-1]
+                    time_offset = last_segment.get("end_time", time_offset)
+            
+            # Save combined transcript
+            transcript_dir = output_dir / "transcripts"
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            transcript_path = transcript_dir / f"{cd_name}_transcript.json"
+            
+            with open(transcript_path, 'w', encoding='utf-8') as f:
+                json.dump(combined_transcript, f, indent=2, ensure_ascii=False)
+            
+            # Generate readable text version
+            text_path = transcript_dir / f"{cd_name}_transcript.txt"
+            with open(text_path, 'w', encoding='utf-8') as f:
+                f.write(f"Yoga CD Transcript: {cd_name}\n")
+                f.write(f"Speaker: Rajyogi Caruso\n")
+                f.write(f"Duration: {combined_transcript['duration_seconds']/60:.1f} minutes\n")
+                f.write(f"Transcription Model: {combined_transcript['model_used']} (chunked)\n")
+                f.write("="*60 + "\n\n")
+                
+                for segment in combined_transcript["segments"]:
+                    start_min = int(segment["start_time"] // 60)
+                    start_sec = int(segment["start_time"] % 60)
+                    f.write(f"[{start_min:02d}:{start_sec:02d}] {segment['text']}\n")
+            
+            print(f"Combined transcript saved: {transcript_path}")
+            print(f"Text transcript: {text_path}")
+            
+            return True, transcript_path
+            
+        except Exception as e:
+            print(f"Error merging chunked transcripts: {e}")
+            return False, None
+
     def process_single_cd(self, 
                          cd_path: Path, 
                          output_dir: Path,
                          skip_combine: bool = False,
                          skip_convert: bool = False,
-                         mp3_file_path: Optional[Path] = None) -> Tuple[bool, Optional[Path]]:
+                         skip_transcribe: bool = False,
+                         mp3_file_path: Optional[Path] = None,
+                         whisper_model: str = "turbo") -> Tuple[bool, Optional[Path]]:
         """
         Process a single CD directory
         
@@ -229,7 +718,9 @@ class YogaCDProcessor:
             output_dir: Base output directory
             skip_combine: Skip the combine step
             skip_convert: Skip the convert step
+            skip_transcribe: Skip the transcribe step
             mp3_file_path: Pre-converted MP3 file path (if skip_convert is True)
+            whisper_model: Whisper model size to use for transcription
             
         Returns:
             Tuple of (success, path_to_mp3_file)
@@ -289,9 +780,35 @@ class YogaCDProcessor:
                 if not self.convert_audio_format(master_m4a_path, mp3_output_path):
                     return False, None
         
+        # Step 3: Transcribe audio (unless skipped)
+        transcript_path = None
+        if skip_transcribe:
+            print("Skipping transcribe step")
+        else:
+            # Check if transcript already exists
+            transcript_dir = output_dir / "transcripts"
+            existing_transcript = transcript_dir / f"{cd_name}_transcript.json"
+            
+            if existing_transcript.exists() and not self.check_file_exists(existing_transcript):
+                print("Skipping transcription due to existing file")
+                transcript_path = existing_transcript
+            else:
+                # Transcribe the MP3 file
+                success, transcript_path = self.transcribe_audio(
+                    mp3_output_path, 
+                    output_dir, 
+                    whisper_model,
+                    use_chunking=getattr(self, 'use_chunking', False),
+                    chunk_duration_minutes=getattr(self, 'chunk_duration_minutes', 10)
+                )
+                if not success:
+                    print("Warning: Transcription failed, but continuing...")
+        
         print(f"Successfully processed CD: {cd_name}")
         print(f"Master M4A: {master_m4a_path}")
         print(f"Master MP3: {mp3_output_path}")
+        if transcript_path:
+            print(f"Transcript: {transcript_path}")
         
         return True, mp3_output_path
 
@@ -303,14 +820,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process all CDs in a directory
+  # Process all CDs in a directory (combine, convert, transcribe)
   python yoga_cd_processor.py /path/to/cds --output ./processed_cds
   
-  # Process a single CD
-  python yoga_cd_processor.py /path/to/single_cd --output ./processed_cds
+  # Process a single CD with specific Whisper model
+  python yoga_cd_processor.py /path/to/single_cd --output ./processed_cds --whisper-model small
+  
+  # Use OpenAI API for transcription (requires API key)
+  python yoga_cd_processor.py /path/to/cds --output ./processed_cds --use-openai-whisper
+  
+  # Use chunking for long audio files to prevent segmentation faults
+  python yoga_cd_processor.py /path/to/cds --output ./processed_cds --chunk-audio --chunk-duration 5
   
   # Skip combine step (files already combined)
   python yoga_cd_processor.py /path/to/cds --output ./processed_cds --skip-combine
+  
+  # Skip transcription (only combine and convert)
+  python yoga_cd_processor.py /path/to/cds --output ./processed_cds --skip-transcribe
   
   # Skip convert step and provide MP3 file
   python yoga_cd_processor.py /path/to/cds --output ./processed_cds --skip-convert --mp3-file /path/to/file.mp3
@@ -342,8 +868,17 @@ Examples:
                        help='Crossfade duration in milliseconds (default: 500)')
     parser.add_argument('--bitrate', default='192k',
                        help='MP3 bitrate (default: 192k)')
+    parser.add_argument('--whisper-model', default='turbo',
+                       choices=['tiny', 'base', 'small', 'medium', 'large', 'turbo'],
+                       help='Whisper model size (default: turbo)')
     parser.add_argument('--use-openai-whisper', action='store_true',
                        help='Use OpenAI API for Whisper instead of local model')
+    parser.add_argument('--chunk-audio', action='store_true',
+                       help='Split long audio into chunks for more stable transcription')
+    parser.add_argument('--chunk-duration', type=int, default=3,
+                       help='Duration of audio chunks in minutes (default: 3)')
+    parser.add_argument('--openai-api-key', 
+                       help='OpenAI API key (or set OPENAI_API_KEY environment variable)')
     
     args = parser.parse_args()
     
@@ -360,6 +895,16 @@ Examples:
         print(f"Error: MP3 file {args.mp3_file} does not exist")
         return 1
     
+    # Set up OpenAI API key if using OpenAI Whisper
+    if args.use_openai_whisper:
+        import os
+        if args.openai_api_key:
+            os.environ['OPENAI_API_KEY'] = args.openai_api_key
+        elif not os.environ.get('OPENAI_API_KEY'):
+            print("Error: OpenAI API key required for --use-openai-whisper")
+            print("Either set OPENAI_API_KEY environment variable or use --openai-api-key")
+            return 1
+    
     # Create output directory
     args.output.mkdir(parents=True, exist_ok=True)
     
@@ -368,6 +913,10 @@ Examples:
         use_openai_whisper=args.use_openai_whisper,
         save_debug_files=True
     )
+    
+    # Set chunking options
+    processor.use_chunking = args.chunk_audio
+    processor.chunk_duration_minutes = args.chunk_duration
     
     # Determine if input is a single CD or directory of CDs
     audio_files = processor.find_audio_files(args.input_path)
@@ -380,7 +929,9 @@ Examples:
             args.output,
             skip_combine=args.skip_combine,
             skip_convert=args.skip_convert,
-            mp3_file_path=args.mp3_file
+            skip_transcribe=args.skip_transcribe,
+            mp3_file_path=args.mp3_file,
+            whisper_model=args.whisper_model
         )
         
         if not success:
@@ -406,7 +957,9 @@ Examples:
                     args.output,
                     skip_combine=args.skip_combine,
                     skip_convert=args.skip_convert,
-                    mp3_file_path=args.mp3_file if len(cd_directories) == 1 else None
+                    skip_transcribe=args.skip_transcribe,
+                    mp3_file_path=args.mp3_file if len(cd_directories) == 1 else None,
+                    whisper_model=args.whisper_model
                 )
                 
                 if success:
@@ -430,10 +983,11 @@ Examples:
             for cd_name in failed_cds:
                 print(f"  ✗ {cd_name}")
     
-    print("\nPhase 1 (Combine & Convert) completed!")
+    print("\nPhase 1 & 2 (Combine, Convert & Transcribe) completed!")
     print("\nNext steps:")
-    print("- Run with transcription options for Phase 2")
-    print("- Use AI-assisted splitting for Phase 3")
+    print("- Review transcripts in the transcripts/ directory")
+    print("- Run with Phase 3 options for AI-assisted splitting")
+    print("- Use transcript data for intelligent audio segmentation")
     
     return 0
 
