@@ -207,8 +207,7 @@ class YogaCDProcessor:
                 # High quality MP3 settings
                 audio.export(str(output_path), 
                            format='mp3', 
-                           bitrate=bitrate,
-                           parameters=["-q:a", "0"])  # Highest quality
+                           bitrate=bitrate)
             elif target_format.lower() == 'wav':
                 # Lossless WAV
                 audio.export(str(output_path), format='wav')
@@ -232,7 +231,8 @@ class YogaCDProcessor:
                            output_path: Path,
                            music_volume: float = 0.3,
                            fade_in_ms: int = 3000,
-                           fade_out_ms: int = 3000) -> bool:
+                           fade_out_ms: int = 3000,
+                           bitrate: str = "192k") -> bool:
         """
         Add background music to main audio with configurable volume and fade
         
@@ -243,6 +243,7 @@ class YogaCDProcessor:
             music_volume: Volume level for background music (0.0 to 1.0)
             fade_in_ms: Fade in duration for music in milliseconds
             fade_out_ms: Fade out duration for music in milliseconds
+            bitrate: MP3 bitrate quality (e.g., "128k", "192k", "256k", "320k")
             
         Returns:
             True if successful, False otherwise
@@ -303,7 +304,7 @@ class YogaCDProcessor:
             export_format = output_path.suffix[1:]
             if export_format.lower() == 'm4a':
                 export_format = 'mp4'
-            mixed_audio.export(str(output_path), format=export_format)
+            mixed_audio.export(str(output_path), format=export_format, bitrate=bitrate)
             
             print(f"Successfully added background music")
             return True
@@ -1105,7 +1106,8 @@ class YogaCDProcessor:
                                  audio_path: Path, 
                                  splits: List[dict], 
                                  output_dir: Path,
-                                 create_m3u: bool = True) -> List[Path]:
+                                 create_m3u: bool = True,
+                                 bitrate: str = '192k') -> List[Path]:
         """
         Split audio file based on transcript analysis
         
@@ -1114,6 +1116,7 @@ class YogaCDProcessor:
             splits: List of split points from transcript analysis
             output_dir: Directory to save split audio files
             create_m3u: Whether to create M3U playlist file
+            bitrate: MP3 bitrate for split tracks (128k, 192k, 256k, 320k)
             
         Returns:
             List of paths to the split audio files
@@ -1155,7 +1158,7 @@ class YogaCDProcessor:
                 segment.export(
                     str(file_path),
                     format='mp3',
-                    bitrate='192k',
+                    bitrate=bitrate,
                     tags={
                         'title': split['title'],
                         'artist': 'Rajyogi Caruso',
@@ -1211,7 +1214,8 @@ class YogaCDProcessor:
     def intelligent_split_workflow(self, 
                                   audio_path: Path, 
                                   transcript_path: Path, 
-                                  output_dir: Path) -> Tuple[bool, List[Path]]:
+                                  output_dir: Path,
+                                  bitrate: str = '192k') -> Tuple[bool, List[Path]]:
         """
         Complete workflow for intelligent audio splitting
         
@@ -1219,6 +1223,7 @@ class YogaCDProcessor:
             audio_path: Path to the audio file
             transcript_path: Path to the transcript JSON file
             output_dir: Output directory for splits
+            bitrate: MP3 bitrate for split tracks (128k, 192k, 256k, 320k)
             
         Returns:
             Tuple of (success, list_of_split_files)
@@ -1249,13 +1254,13 @@ class YogaCDProcessor:
             
             # Step 2: Split audio based on time segments
             print(f"\nSplitting audio into {len(splits)} content-based segments...")
-            split_files = self.split_audio_by_transcript(audio_path, splits, output_dir)
+            split_files = self.split_audio_by_transcript(audio_path, splits, output_dir, bitrate=bitrate)
             
             if split_files:
                 print(f"\n✅ Successfully created {len(split_files)} tracks")
                 print("📁 Each track includes:")
                 print("   • Proper metadata (title, artist, album, track number)")
-                print("   • High-quality 192k MP3 encoding")
+                print(f"   • High-quality {bitrate} MP3 encoding")
                 print("   • Intelligent content-based segmentation")
                 print("📱 M3U playlist created for easy playback")
                 return True, split_files
@@ -1351,7 +1356,8 @@ class YogaCDProcessor:
                          background_music: Optional[str] = None,
                          music_volume: float = 0.3,
                          fade_in: int = 3000,
-                         fade_out: int = 3000) -> Tuple[bool, Optional[Path]]:
+                         fade_out: int = 3000,
+                         bitrate: str = '192k') -> Tuple[bool, Optional[Path]]:
         """
         Process a single CD directory
         
@@ -1369,6 +1375,7 @@ class YogaCDProcessor:
             music_volume: Volume level for background music (0.0 to 1.0)
             fade_in: Fade in time for background music (milliseconds)
             fade_out: Fade out time for background music (milliseconds)
+            bitrate: MP3 bitrate for audio quality (128k, 192k, 256k, 320k)
             
         Returns:
             Tuple of (success, path_to_mp3_file)
@@ -1426,7 +1433,7 @@ class YogaCDProcessor:
                 print("Skipping due to existing file")
             else:
                 # Convert master M4A to MP3
-                if not self.convert_audio_format(master_m4a_path, mp3_output_path):
+                if not self.convert_audio_format(master_m4a_path, mp3_output_path, bitrate=bitrate):
                     return False, None
         
         # Step 2.5: Add background music (if specified)
@@ -1441,7 +1448,8 @@ class YogaCDProcessor:
                 music_output_path,
                 music_volume,
                 fade_in,
-                fade_out
+                fade_out,
+                bitrate
             ):
                 final_mp3_path = music_output_path
                 print(f"Background music added successfully: {final_mp3_path}")
@@ -1488,7 +1496,8 @@ class YogaCDProcessor:
                 success, split_files = self.intelligent_split_workflow(
                     final_mp3_path,  # Use final_mp3_path which may include background music
                     transcript_path, 
-                    output_dir
+                    output_dir,
+                    bitrate=bitrate
                 )
                 if not success:
                     print("Warning: Intelligent splitting failed, but continuing...")
@@ -1524,6 +1533,9 @@ Examples:
   
   # Use custom crossfade duration
   python yoga_cd_processor.py /path/to/cds --output ./processed_cds --crossfade 1000
+  
+  # High quality audio with maximum bitrate
+  python yoga_cd_processor.py /path/to/cds --output ./processed_cds --bitrate 320k
   
   # Add background music with default settings
   python yoga_cd_processor.py /path/to/cds --output ./processed_cds --background-music /path/to/ambient.mp3
@@ -1575,7 +1587,8 @@ Examples:
     parser.add_argument('--crossfade', type=int, nargs='?', const=500, default=0,
                        help='Enable crossfade with optional duration in milliseconds (default: 500ms when flag is used, 0ms when omitted)')
     parser.add_argument('--bitrate', default='192k',
-                       help='MP3 bitrate (default: 192k)')
+                       choices=['128k', '192k', '256k', '320k'],
+                       help='MP3 bitrate quality (default: 192k). Higher bitrates = better quality + larger files')
     parser.add_argument('--whisper-model', default='turbo',
                        choices=['tiny', 'base', 'small', 'medium', 'large', 'turbo'],
                        help='Whisper model size (default: turbo)')
@@ -1680,7 +1693,8 @@ Examples:
             background_music=str(args.background_music) if args.background_music else None,
             music_volume=args.music_volume,
             fade_in=args.fade_in,
-            fade_out=args.fade_out
+            fade_out=args.fade_out,
+            bitrate=args.bitrate
         )
         
         if not success:
@@ -1714,7 +1728,8 @@ Examples:
                     background_music=str(args.background_music) if args.background_music else None,
                     music_volume=args.music_volume,
                     fade_in=args.fade_in,
-                    fade_out=args.fade_out
+                    fade_out=args.fade_out,
+                    bitrate=args.bitrate
                 )
                 
                 if success:
