@@ -1,2 +1,5 @@
+__pycache__/
 output/
 venv*/
+*.mp3
+*.m4a
